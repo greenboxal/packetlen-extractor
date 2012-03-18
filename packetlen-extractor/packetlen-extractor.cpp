@@ -220,7 +220,7 @@ unsigned char *SkipInstruction(unsigned char *func)
 }
 
 extern char *defaultEndAddress;
-DWORD FindBPAddr(char *startAddr, char *endAddr)
+DWORD FindBPAddr(char *startAddr, char *endAddr, DWORD *end)
 {
 	unsigned char *packet_start, *packet_end;
 
@@ -253,7 +253,7 @@ DWORD FindBPAddr(char *startAddr, char *endAddr)
 		{
 			calls++;
 			
-			if (calls == 2) 
+			if (calls == 10) 
 				break;
 		}
 
@@ -263,13 +263,15 @@ DWORD FindBPAddr(char *startAddr, char *endAddr)
 		packet_start = SkipInstruction(packet_start);
 	}
 
+	*end = (DWORD)(packet_end - (DWORD)startAddr);
+
 	return (DWORD)(packet_start - (DWORD)startAddr);
 }
 
 void TraverseStart(HANDLE hProc, DWORD addr);
 void Traverse(HANDLE hProc, struct PacketLenStruct *node)
 {
-	if (node->parent == NULL || node->key == 0 || node->value == 0xbaadf00d)
+	if (node->parent == NULL || node->key == 0 || node->key > 0xFFFF)
 		return;
 
 	TraverseStart(hProc, (DWORD)node->left);
@@ -279,27 +281,44 @@ void Traverse(HANDLE hProc, struct PacketLenStruct *node)
 
 void TraverseStart(HANDLE hProc, DWORD addr)
 {
+	PacketLenStruct *node = new PacketLenStruct();
+
+	SimpleRPM(hProc, addr, (char *)node, sizeof(struct PacketLenStruct));
+
+	Traverse(hProc, node);
+
+	delete node;
+}
+
+DWORD FindParent(HANDLE hProc, DWORD addr)
+{
 	struct PacketLenStruct node;
 
-	SimpleRPM(hProc, addr, (char *)&node, sizeof(struct PacketLenStruct));
+	//do
+	//{
+		SimpleRPM(hProc, (DWORD)addr, (char *)&node, sizeof(struct PacketLenStruct));
 
-	Traverse(hProc, &node);
+		if (node.parent != NULL)
+			addr = (DWORD)node.parent;
+	//}
+	//while (node.parent != NULL && node.right != node.parent);
+
+	return addr;
 }
 
 void TraverseBegin(HANDLE hProc, DWORD addr)
 {
-	struct PacketLenStruct node;
-	
 	SimpleRPM(hProc, addr, (char *)&addr, sizeof(DWORD));
-	SimpleRPM(hProc, addr, (char *)&node, sizeof(struct PacketLenStruct));
 
-	TraverseStart(hProc, (DWORD)node.parent);
+	TraverseStart(hProc, FindParent(hProc, addr));
 }
 
 void EnterDebugLoop(const LPDEBUG_EVENT de)
 {
 	DWORD dwState = 0;
 	DWORD baseAddr = 0;
+	DWORD ecx = 0;
+	DWORD finalBp = 0;
 
 	HANDLE hProcess, hThread;
 
@@ -348,9 +367,11 @@ void EnterDebugLoop(const LPDEBUG_EVENT de)
 						CloseHandle(hSnapshot);
 					}
 					
-					addr = FindBPAddr(dumpStart, dumpStart + dumpSize) + baseAddr;
+					addr = FindBPAddr(dumpStart, dumpStart + dumpSize, &finalBp) + baseAddr;
 					printf("Packetlen code found at 0x%x, waiting breakpoint...\n", addr);
 					
+					finalBp += baseAddr;
+
 					SetHWBP(hThread, (unsigned long)addr);
 					ResumeThread(hThread);
 				}
@@ -364,9 +385,19 @@ void EnterDebugLoop(const LPDEBUG_EVENT de)
 						CONTEXT c = {CONTEXT_INTEGER};
 
 						GetThreadContext(hThread, &c);
-						TraverseBegin(hProcess, c.Ecx + 4);
+						ecx = c.Ecx;
 
+						SetHWBP(hThread, (unsigned long)finalBp);
+
+						dwState++;
+					}
+					else if (dwState == 3)
+					{
+						TraverseBegin(hProcess, ecx + 4);
+						
 						RemoveHWBP(hThread);
+
+						return;
 					}
 				}
 				break;
@@ -437,7 +468,7 @@ int main(int argc, char *argv[])
 		return 0;
 	}
 
-	printf("Enabling debug privileges.\n");
+	printf("Enabling debug privileges...\n");
 	EnableDebugPrivileges();
 
 	PROCESS_INFORMATION pi;
@@ -482,6 +513,8 @@ int main(int argc, char *argv[])
 			fprintf(fp, "addpacket(0x%x,%d,NULL);\n", it->first, it->second);
 		}
 	}
+
+	printf("Packetlen extracted.\n");
 
 	fclose(fp);
 
